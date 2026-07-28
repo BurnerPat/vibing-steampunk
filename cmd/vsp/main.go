@@ -290,15 +290,14 @@ func runServer(cmd *cobra.Command, _ []string) error {
 		}
 	}()
 
-	// Connect phase: validate credentials and establish transports
-	if err := srv.Connect(context.Background()); err != nil {
-		return fmt.Errorf("failed to connect to systems: %w", err)
-	}
-
-	// Start phase: activate runtime behavior (e.g., keep-alive)
-	if err := srv.Start(context.Background()); err != nil {
-		return fmt.Errorf("failed to start systems: %w", err)
-	}
+	// Begin serving immediately. Connecting to SAP and starting the JCo sidecar
+	// can take several seconds; doing that synchronously here would delay the MCP
+	// protocol handshake and cause the client's first tool call to fail with an
+	// undefined-reference error. Instead, register tools now and warm up each
+	// system's connection in the background. Tool handlers block on the target
+	// system's readiness (see System.EnsureReady) so the first call is slow but
+	// succeeds.
+	srv.ConnectAsync()
 
 	return srv.ServeStdio()
 }

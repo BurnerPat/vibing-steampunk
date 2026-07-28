@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -22,12 +23,17 @@ import (
 // It holds the connection (ADT client), sidecar manager,
 // feature prober, and per-system state. System implements types.System.
 type System struct {
+	id                  string // original-cased system ID (for logging)
 	adtClient           *adt.Client
 	config              *config.SystemConfig    // Per-system configuration
 	featureProber       *adt.FeatureProber      // Feature detection system (safety network)
 	sidecar             *adt.SidecarManager     // JCo sidecar (RFC mode only)
 	cookies             map[string]string       // Runtime cookies (browser-auth, cookie-file, etc.)
 	discoveredEndpoints adt.DiscoveredEndpoints // ADT endpoints from /sap/bc/adt/discovery
+
+	ready     chan struct{} // closed when InitAsync completes (success or failure)
+	readyOnce sync.Once     // guards the single InitAsync kickoff
+	initErr   error         // result of background init; read only after <-ready
 }
 
 // Ensure System implements types.System at compile time.
@@ -94,6 +100,62 @@ func (s *System) Start(_ context.Context) error {
 	}
 
 	return nil
+}
+
+// InitAsync implements types.System. It performs background initialization:
+// starting the JCo sidecar (RFC mode), discovering ADT endpoints (Connect) and
+// activating runtime behavior (Start). It is non-blocking and idempotent; the
+// first call kicks off a goroutine, subsequent calls are no-ops. Handlers wait
+// for completion via EnsureReady.
+func (s *System) InitAsync() {
+	s.readyOnce.Do(func() {
+		go func() {
+			defer close(s.ready)
+			ctx := context.Background()
+
+			// Start the JCo sidecar first (RFC mode only). This is the slow step:
+			// JVM boot + native library load + SAP logon can take several seconds.
+			if s.sidecar != nil {
+				if err := s.sidecar.Start(ctx); err != nil {
+					s.initErr = fmt.Errorf("failed to start JCo sidecar: %w", err)
+					_, _ = fmt.Fprintf(os.Stderr, "[ERROR] system %q init failed: %v\n", s.id, s.initErr)
+					return
+				}
+			}
+
+			// Validate credentials / establish session and discover endpoints.
+			if err := s.Connect(ctx); err != nil {
+				s.initErr = err
+				_, _ = fmt.Fprintf(os.Stderr, "[ERROR] system %q init failed: %v\n", s.id, err)
+				return
+			}
+
+			// Activate runtime behavior (e.g., keep-alive for HTTP mode).
+			if err := s.Start(ctx); err != nil {
+				s.initErr = err
+				_, _ = fmt.Fprintf(os.Stderr, "[ERROR] system %q init failed: %v\n", s.id, err)
+				return
+			}
+
+			if s.config.IsVerbose() {
+				_, _ = fmt.Fprintf(os.Stderr, "[VERBOSE] system %q initialized and ready\n", s.id)
+			}
+		}()
+	})
+}
+
+// EnsureReady implements types.System. It blocks until background initialization
+// started by InitAsync has completed, or until ctx is cancelled. It returns the
+// initialization error, if any. As a safety net it triggers InitAsync so a
+// handler still works even if the server never warmed the system up.
+func (s *System) EnsureReady(ctx context.Context) error {
+	s.InitAsync()
+	select {
+	case <-s.ready:
+		return s.initErr
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // Shutdown implements types.System by gracefully stopping system resources.
@@ -176,6 +238,7 @@ func newSystemInstance(cfg config.SystemConfig, cookies map[string]string) (*Sys
 		cookies:       cookies,
 		featureProber: adt.NewFeatureProber(adtClient, featureConfig, cfg.IsVerbose()),
 		sidecar:       sidecar,
+		ready:         make(chan struct{}),
 	}
 
 	// NOTE: No eager keep-alive or connection validation here.
@@ -202,10 +265,11 @@ func createRFCADTClient(cfg *config.SystemConfig, opts []adt.Option) (*adt.Clien
 
 	sidecarCfg := cfg.BuildSidecarConfig()
 	sidecar := adt.NewSidecarManager(sidecarCfg)
-
-	if err := sidecar.Start(context.Background()); err != nil {
-		return nil, nil, fmt.Errorf("failed to start JCo sidecar: %w", err)
-	}
+	// NOTE: the sidecar is intentionally NOT started here. Booting the JVM,
+	// loading the JCo native library and performing the SAP logon can take several
+	// seconds. Starting it lazily in the background (System.InitAsync) lets the MCP
+	// server answer the protocol handshake immediately; handlers block on
+	// System.EnsureReady before their first use.
 
 	maxConcurrent := 5
 	if g := config.GetInstance(); g.RfcMaxConcurrent > 0 {

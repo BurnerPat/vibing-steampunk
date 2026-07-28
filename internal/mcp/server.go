@@ -74,6 +74,7 @@ func NewServer(globalCfg *config.GlobalConfig, runtimeCookies map[string]map[str
 		if err != nil {
 			return nil, fmt.Errorf("failed to create system for %q: %w", sysID, err)
 		}
+		sys.id = sysID
 
 		router.AddSystem(sysID, sys)
 
@@ -100,69 +101,35 @@ func NewServer(globalCfg *config.GlobalConfig, runtimeCookies map[string]map[str
 	}, nil
 }
 
-// Connect validates credentials and establishes connections for all systems.
-// Iterates over all systems calling System.Connect(ctx).
-// Fails fast on first error and returns it wrapped with system ID context.
-// After attempting connections, registers tools with discovery-based filtering.
-// Tools are always registered even if connection fails, to support schema-only tests.
-func (s *Server) Connect(ctx context.Context) error {
-	if s.router == nil {
-		return fmt.Errorf("server router not initialized")
-	}
-
-	var connectErr error
-	for sysID, sys := range s.router.systems {
-		if s.config.Verbose {
-			_, _ = fmt.Fprintf(os.Stderr, "[VERBOSE] Connecting to system %q...\n", sysID)
-		}
-
-		if err := sys.Connect(ctx); err != nil {
-			connectErr = fmt.Errorf("failed to connect to system %q: %w", sysID, err)
-			break
-		}
-
-		if s.config.Verbose {
-			_, _ = fmt.Fprintf(os.Stderr, "[VERBOSE] Connected to system %q\n", sysID)
-		}
-	}
-
-	// Register tools after connection attempts.
-	// This ensures ADT discovery results (if available) are used for endpoint-based filtering.
-	// Tools are registered even if connection failed (with no endpoint filtering).
-	s.RegisterTools()
-
-	return connectErr
-}
-
-// RegisterTools registers all tools with permission and endpoint-based filtering.
-// Must be called after Connect() so that ADT discovery results are available.
+// RegisterTools registers all tools with permission-based filtering.
+// It is called by ConnectAsync before background discovery runs, so no
+// endpoint-based filtering is applied at registration time.
 func (s *Server) RegisterTools() {
 	s.router.RegisterTools(s.config, s.router.systems)
 }
 
-// Start activates runtime behavior for all systems (e.g., session keep-alive).
-// Iterates over all systems calling System.Start(ctx).
-// Fails fast on first error and returns it wrapped with system ID context.
-func (s *Server) Start(ctx context.Context) error {
+// ConnectAsync prepares the server to serve immediately without blocking on slow
+// SAP/JCo startup. It registers the full (permission-filtered) tool set right away
+// so the MCP handshake and tools/list respond instantly, then warms up each
+// system's connection (JCo sidecar startup + endpoint discovery + runtime
+// activation) in the background. Tool handlers block on System.EnsureReady until
+// the target system finishes initializing, so the first call may be slow but
+// succeeds instead of racing an unready server.
+//
+// Because discovery has not run yet when tools are registered, no endpoint-based
+// filtering is applied at registration time; the full permission-enabled set is
+// exposed. Endpoint availability is still enforced per call once the system is
+// ready via the runtime permission checks in the router.
+func (s *Server) ConnectAsync() {
 	if s.router == nil {
-		return fmt.Errorf("server router not initialized")
+		return
 	}
 
-	for sysID, sys := range s.router.systems {
-		if s.config.Verbose {
-			_, _ = fmt.Fprintf(os.Stderr, "[VERBOSE] Starting runtime for system %q...\n", sysID)
-		}
+	s.RegisterTools()
 
-		if err := sys.Start(ctx); err != nil {
-			return fmt.Errorf("failed to start runtime for system %q: %w", sysID, err)
-		}
-
-		if s.config.Verbose {
-			_, _ = fmt.Fprintf(os.Stderr, "[VERBOSE] Runtime started for system %q\n", sysID)
-		}
+	for _, sys := range s.router.systems {
+		sys.InitAsync()
 	}
-
-	return nil
 }
 
 // resolveSystemCookies resolves runtime cookies for a system in this precedence:

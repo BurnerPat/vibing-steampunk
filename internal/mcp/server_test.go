@@ -107,13 +107,15 @@ func TestNewServer(t *testing.T) {
 		t.Error("ADT client on default system should not be nil")
 	}
 
-	// Connect and Start (will fail due to invalid URL, but that's expected in this test)
+	// Warm up in the background; connecting will fail due to the invalid URL.
+	// The failure is surfaced through the target system's EnsureReady.
 	ctx := context.Background()
-	if err := srv.Connect(ctx); err == nil {
-		t.Fatalf("srv.Connect should fail with invalid URL, but succeeded")
+	srv.ConnectAsync()
+	if err := sys.EnsureReady(ctx); err == nil {
+		t.Fatalf("EnsureReady should fail with invalid URL, but succeeded")
 	}
 
-	// Shutdown should work regardless of whether Connect succeeded
+	// Shutdown should work regardless of whether initialization succeeded
 	if err := srv.Shutdown(); err != nil {
 		t.Fatalf("srv.Shutdown failed: %v", err)
 	}
@@ -142,10 +144,10 @@ func TestDebuggerGetVariablesSchemaIncludesItems(t *testing.T) {
 		t.Fatal("server or MCP server is nil")
 	}
 
-	// Call lifecycle methods (will fail on Connect due to invalid URL, but that's OK for schema test)
-	ctx := context.Background()
-	_ = srv.Connect(ctx) // Expected to fail; we're only testing schema
-	_ = srv.Start(ctx)   // Expected to fail; we're only testing schema
+	// Register tools and warm up the connection in the background. Tool
+	// registration is synchronous, so the schema is available for tools/list
+	// even though connecting to the invalid URL will fail in the background.
+	srv.ConnectAsync()
 	defer func() {
 		_ = srv.Shutdown()
 	}()

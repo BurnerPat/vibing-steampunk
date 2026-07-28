@@ -84,6 +84,13 @@ func (r *Router) HandleToolCall(ctx context.Context, td *types.ToolDef, request 
 		return types.ErrorResult(fmt.Sprintf("Unknown system: %s. Available: %s", systemID, strings.Join(r.systemIDs, ", "))), nil
 	}
 
+	// 1b. Wait for the target system to finish background initialization
+	//     (JCo sidecar startup + endpoint discovery). The first call after the
+	//     server starts may block here until the system is ready.
+	if err := sys.EnsureReady(ctx); err != nil {
+		return types.ErrorResult(fmt.Sprintf("System %q failed to initialize: %v", systemID, err)), nil
+	}
+
 	// 2. Permission check (tool-level)
 	if !r.permissionManager.IsToolEnabledForSystem(systemID, td.Tool.Name) {
 		enabledTools := r.permissionManager.GetEnabledToolsForSystem(systemID)
