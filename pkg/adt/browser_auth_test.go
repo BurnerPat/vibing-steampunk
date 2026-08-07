@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/chromedp/cdproto/network"
 )
 
 func TestSaveCookiesToFile(t *testing.T) {
@@ -100,6 +102,55 @@ func TestBrowserLogin_InvalidURL(t *testing.T) {
 	_, err = BrowserLogin(nil, "not-a-url", false, 0, "", false)
 	if err == nil {
 		t.Error("expected error for invalid URL")
+	}
+}
+
+func TestHasSAPAuthCookie(t *testing.T) {
+	tests := []struct {
+		name       string
+		cookies    []*network.Cookie
+		currentURL string
+		want       bool
+	}{
+		{
+			name:       "pre-login JSESSIONID at identity provider",
+			cookies:    []*network.Cookie{{Name: "JSESSIONID"}},
+			currentURL: "https://systems-login.example.com/auth/login",
+			want:       false,
+		},
+		{
+			name:       "BTP JSESSIONID after returning to SAP host",
+			cookies:    []*network.Cookie{{Name: "JSESSIONID"}},
+			currentURL: "https://sap.example.com:44300/sap/bc/adt/",
+			want:       true,
+		},
+		{
+			name:       "BTP JSESSIONID during login callback",
+			cookies:    []*network.Cookie{{Name: "JSESSIONID"}},
+			currentURL: "https://sap.example.com:44300/login/callback?code=example",
+			want:       false,
+		},
+		{
+			name:       "SAP session cookie during redirect",
+			cookies:    []*network.Cookie{{Name: "SAP_SESSIONID_A4H_001"}},
+			currentURL: "https://login.example.com/",
+			want:       true,
+		},
+		{
+			name:       "weak cookie after returning to SAP host",
+			cookies:    []*network.Cookie{{Name: "sap-usercontext"}},
+			currentURL: "https://sap.example.com:44300/sap/bc/adt/",
+			want:       false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := hasSAPAuthCookie(tt.cookies, tt.currentURL, "https://sap.example.com:44300")
+			if got != tt.want {
+				t.Fatalf("hasSAPAuthCookie() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
 

@@ -25,8 +25,9 @@ import (
 var sapAuthCookieNames = []string{
 	"MYSAPSSO2",
 	"SAP_SESSIONID",
-	"JSESSIONID",
 }
+
+const btpAuthCookieName = "JSESSIONID"
 
 // sapWeakCookieNames are set before/during authentication and are not sufficient alone.
 var sapWeakCookieNames = []string{
@@ -496,6 +497,11 @@ func pollForSAPCookies(ctx context.Context, sapURL string, verbose bool) (map[st
 // extractSAPCookies retrieves all cookies from the browser and checks for SAP auth cookies.
 func extractSAPCookies(ctx context.Context, sapURL string) (map[string]string, bool, error) {
 	var browserCookies []*network.Cookie
+	var currentURL string
+
+	// A JSESSIONID can now be set before authentication. Only treat it as a BTP
+	// auth cookie after the flow has left the identity provider and callback.
+	_ = chromedp.Run(ctx, chromedp.Location(&currentURL))
 
 	if err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
 		var err error
@@ -508,22 +514,38 @@ func extractSAPCookies(ctx context.Context, sapURL string) (map[string]string, b
 	}
 
 	result := make(map[string]string)
-	hasAuthCookie := false
 
 	for _, c := range browserCookies {
 		result[c.Name] = c.Value
+	}
 
-		// Only strong auth cookies count (MYSAPSSO2, SAP_SESSIONID*).
-		// sap-usercontext is set before login completes and is not sufficient.
+	return result, hasSAPAuthCookie(browserCookies, currentURL, sapURL), nil
+}
+
+func hasSAPAuthCookie(cookies []*network.Cookie, currentURL, sapURL string) bool {
+	for _, cookie := range cookies {
 		for _, prefix := range sapAuthCookieNames {
-			if strings.HasPrefix(c.Name, prefix) {
-				hasAuthCookie = true
-				break
+			if strings.HasPrefix(cookie.Name, prefix) {
+				return true
 			}
 		}
 	}
 
-	return result, hasAuthCookie, nil
+	current, currentErr := url.Parse(currentURL)
+	sap, sapErr := url.Parse(sapURL)
+	if currentErr != nil || sapErr != nil ||
+		!strings.EqualFold(current.Host, sap.Host) ||
+		strings.HasPrefix(current.Path, "/login/") {
+		return false
+	}
+
+	for _, cookie := range cookies {
+		if strings.HasPrefix(cookie.Name, btpAuthCookieName) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // SaveCookiesToFile writes cookies in Netscape cookie file format.
