@@ -203,7 +203,7 @@ func newSystemInstance(cfg config.SystemConfig, cookies map[string]string) (*Sys
 				}
 			}
 			_, _ = fmt.Fprintf(os.Stderr, "[BROWSER-AUTH] Session expired, re-authenticating...\n")
-			newCookies, err := adt.BrowserLoginWithTarget(ctx, sysCfg.URL, sysCfg.BrowserAuthURL, sysCfg.Insecure, timeout, sysCfg.BrowserExec, sysCfg.IsVerbose())
+			newCookies, err := adt.BrowserLoginWithTargetForClient(ctx, sysCfg.URL, sysCfg.BrowserAuthURL, sysCfg.Client, sysCfg.Language, sysCfg.Insecure, timeout, sysCfg.BrowserExec, sysCfg.IsVerbose())
 			if err != nil {
 				return nil, err
 			}

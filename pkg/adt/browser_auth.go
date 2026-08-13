@@ -2,14 +2,18 @@ package adt
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -28,6 +32,10 @@ var sapAuthCookieNames = []string{
 }
 
 const btpAuthCookieName = "JSESSIONID"
+
+const systemInformationRelation = "http://www.sap.com/adt/categories/core/http/system/systeminformation"
+
+const sessionInformationAccept = "application/vnd.sap.adt.core.http.session.v3+xml, application/vnd.sap.adt.core.http.session.v2+xml, application/vnd.sap.adt.core.http.session.v1+xml"
 
 // sapWeakCookieNames are set before/during authentication and are not sufficient alone.
 var sapWeakCookieNames = []string{
@@ -134,35 +142,34 @@ func buildBrowserAuthTargetURL(sapURL, override string) (string, error) {
 	return baseURL + "/" + override, nil
 }
 
-// BrowserLogin opens a headed browser window to the SAP system URL, waits for
-// SSO authentication to complete (Kerberos/SPNEGO, Keycloak, SAML, etc.),
-// and returns the session cookies.
+// BrowserLogin opens the SAP reentrance-ticket flow in the system browser,
+// waits for its loopback callback, and returns the resulting session cookies.
 //
-// If execPath is empty, it auto-detects an installed Chromium-based browser
-// (Edge, Chrome, Chromium, Brave). Set execPath to force a specific browser.
-//
-// The browser navigates to the ADT discovery endpoint which requires authentication,
-// triggering the SSO redirect. Once SAP-specific cookies appear, they are extracted
-// and the browser is closed.
-//
-// We launch the browser process manually and connect via RemoteAllocator instead
-// of using chromedp's ExecAllocator. ExecAllocator has a known race condition
-// where its cmd.Wait goroutine can panic with "close of closed channel" when the
-// browser process exits unexpectedly (common in MCP host environments like VS Code
-// that manage child process lifecycles).
+// Set execPath to use the legacy automated Chromium flow instead. That fallback
+// launches the process manually and connects via RemoteAllocator to avoid a known
+// ExecAllocator process-exit race in MCP host environments.
 func BrowserLogin(ctx context.Context, sapURL string, insecure bool, timeout time.Duration, execPath string, verbose bool) (map[string]string, error) {
 	return BrowserLoginWithTarget(ctx, sapURL, "", insecure, timeout, execPath, verbose)
 }
 
-// BrowserLoginWithTarget behaves like BrowserLogin but allows overriding
-// the browser navigation target URL (absolute URL or URL path).
+// BrowserLoginWithTarget behaves like BrowserLogin. A target override requires
+// the automated Chromium flow because arbitrary targets cannot issue callbacks.
 func BrowserLoginWithTarget(ctx context.Context, sapURL, targetOverride string, insecure bool, timeout time.Duration, execPath string, verbose bool) (map[string]string, error) {
+	return BrowserLoginWithTargetForClient(ctx, sapURL, targetOverride, "", "", insecure, timeout, execPath, verbose)
+}
+
+// BrowserLoginWithTargetForClient includes the SAP client and language in the
+// native browser preflight, matching the login flow used by Eclipse ADT.
+func BrowserLoginWithTargetForClient(ctx context.Context, sapURL, targetOverride, client, language string, insecure bool, timeout time.Duration, execPath string, verbose bool) (map[string]string, error) {
 	u, err := url.Parse(sapURL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid SAP URL: %w", err)
 	}
 	if u.Scheme == "" || u.Host == "" {
 		return nil, fmt.Errorf("invalid SAP URL (missing scheme or host): %s", sapURL)
+	}
+	if execPath == "" && strings.TrimSpace(targetOverride) == "" {
+		return nativeBrowserLogin(ctx, sapURL, client, language, insecure, timeout, verbose)
 	}
 
 	// Target URL that requires authentication and renders HTML.
@@ -197,11 +204,11 @@ func BrowserLoginWithTarget(ctx context.Context, sapURL, targetOverride string, 
 	// Launch browser manually and get DevTools WebSocket URL.
 	// We manage the process ourselves to avoid chromedp ExecAllocator's
 	// goroutine race condition on browser process exit.
-	wsURL, cmd, dataDir, debugPort, err := launchBrowserProcess(ctx, execPath, u.Host, insecure, verbose)
+	wsURL, cmd, debugPort, err := launchBrowserProcess(ctx, execPath, u.Host, insecure, verbose)
 	if err != nil {
 		return nil, fmt.Errorf("failed to launch %s: %w", browserName, err)
 	}
-	defer cleanupBrowser(cmd, dataDir)
+	defer cleanupBrowser(cmd)
 
 	// Connect to the browser via RemoteAllocator (no ExecAllocator goroutines).
 	allocCtx, allocCancel := chromedp.NewRemoteAllocator(ctx, wsURL)
@@ -273,6 +280,301 @@ func BrowserLoginWithTarget(ctx context.Context, sapURL, targetOverride string, 
 	return cookies, nil
 }
 
+func nativeBrowserLogin(ctx context.Context, sapURL, client, language string, insecure bool, timeout time.Duration, verbose bool) (map[string]string, error) {
+	apiURL, uiURL, err := resolveSystemURLs(ctx, sapURL, insecure)
+	if err != nil {
+		return nil, err
+	}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return nil, fmt.Errorf("failed to start browser auth callback: %w", err)
+	}
+	defer listener.Close()
+
+	port := listener.Addr().(*net.TCPAddr).Port
+	callbackURL := fmt.Sprintf("http://localhost:%d/adt/redirect", port)
+	ticketResult := make(chan string, 1)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/adt/redirect", func(w http.ResponseWriter, req *http.Request) {
+		ticket := strings.TrimSpace(req.URL.Query().Get("reentrance-ticket"))
+		if ticket == "" {
+			http.Error(w, "Missing reentrance ticket", http.StatusBadRequest)
+			return
+		}
+		select {
+		case ticketResult <- ticket:
+		default:
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, "<!doctype html><title>VSP authentication</title><p>Authentication received. You can close this tab.</p>")
+	})
+
+	server := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	serveDone := make(chan struct{})
+	go func() {
+		_ = server.Serve(listener)
+		close(serveDone)
+	}()
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = server.Shutdown(shutdownCtx)
+		<-serveDone
+	}()
+
+	loginURL, err := buildReentranceTicketURL(uiURL, callbackURL)
+	if err != nil {
+		return nil, err
+	}
+	fmt.Fprintf(os.Stderr, "[BROWSER-AUTH] Opening the system browser for SSO login: %s\n", uiURL)
+	fmt.Fprintf(os.Stderr, "[BROWSER-AUTH] Complete login in the browser window. Timeout: %s\n", timeout)
+	if err := openSystemBrowser(loginURL); err != nil {
+		return nil, fmt.Errorf("failed to open system browser: %w", err)
+	}
+
+	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	select {
+	case ticket := <-ticketResult:
+		cookies, err := exchangeReentranceTicket(timeoutCtx, apiURL, ticket, client, language, insecure)
+		if err != nil {
+			return nil, err
+		}
+		fmt.Fprintf(os.Stderr, "[BROWSER-AUTH] Authentication successful! Extracted %d cookies\n", len(cookies))
+		if verbose {
+			for name := range cookies {
+				fmt.Fprintf(os.Stderr, "[BROWSER-AUTH]   cookie: %s\n", name)
+			}
+		}
+		return cookies, nil
+	case <-timeoutCtx.Done():
+		return nil, fmt.Errorf("browser auth timed out after %s — login was not completed", timeout)
+	}
+}
+
+// ResolveBrowserAuthAPIURL returns the API base URL used for ADT requests.
+// Cloud systems can expose a separate UI URL for browser authentication.
+func ResolveBrowserAuthAPIURL(ctx context.Context, sapURL string, insecure bool) (string, error) {
+	apiURL, _, err := resolveSystemURLs(ctx, sapURL, insecure)
+	return apiURL, err
+}
+
+func resolveSystemURLs(ctx context.Context, sapURL string, insecure bool) (string, string, error) {
+	baseURL := strings.TrimRight(sapURL, "/")
+	endpoint := strings.TrimRight(sapURL, "/") + "/sap/public/bc/icf/virtualhost"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to create SAP host discovery request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{
+		InsecureSkipVerify: insecure, //nolint:gosec
+	}}}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to discover SAP system URLs: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusNotImplemented {
+		return baseURL, baseURL, nil
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", "", fmt.Errorf("SAP host discovery failed: HTTP %s", resp.Status)
+	}
+
+	var hostInfo struct {
+		RelatedURLs struct {
+			API string `json:"API"`
+			UI  string `json:"UI"`
+		} `json:"relatedUrls"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&hostInfo); err != nil {
+		return "", "", fmt.Errorf("invalid SAP host discovery response: %w", err)
+	}
+	apiURL, err := normalizeDiscoveredBaseURL(hostInfo.RelatedURLs.API)
+	if err != nil {
+		return "", "", fmt.Errorf("invalid SAP API URL in host discovery response: %q", hostInfo.RelatedURLs.API)
+	}
+	uiURL, err := normalizeDiscoveredBaseURL(hostInfo.RelatedURLs.UI)
+	if err != nil {
+		return "", "", fmt.Errorf("invalid SAP UI URL in host discovery response: %q", hostInfo.RelatedURLs.UI)
+	}
+	return apiURL, uiURL, nil
+}
+
+func normalizeDiscoveredBaseURL(rawURL string) (string, error) {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "", fmt.Errorf("invalid URL")
+	}
+	parsed.Path = ""
+	parsed.RawPath = ""
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return strings.TrimRight(parsed.String(), "/"), nil
+}
+
+func buildReentranceTicketURL(sapURL, callbackURL string) (string, error) {
+	base, err := url.Parse(strings.TrimRight(sapURL, "/") + "/sap/bc/adt/core/http/reentranceticket")
+	if err != nil {
+		return "", fmt.Errorf("invalid SAP URL: %w", err)
+	}
+	query := base.Query()
+	query.Set("redirect-url", callbackURL)
+	query.Set("_", fmt.Sprintf("%d", time.Now().UnixMilli()))
+	base.RawQuery = query.Encode()
+	return base.String(), nil
+}
+
+func openSystemBrowser(targetURL string) error {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("open", targetURL)
+	case "windows":
+		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", targetURL)
+	default:
+		cmd = exec.Command("xdg-open", targetURL)
+	}
+	return cmd.Run()
+}
+
+func exchangeReentranceTicket(ctx context.Context, sapURL, ticket, client, language string, insecure bool) (map[string]string, error) {
+	sessionsURL, err := url.Parse(strings.TrimRight(sapURL, "/") + "/sap/bc/adt/core/http/sessions")
+	if err != nil {
+		return nil, fmt.Errorf("invalid SAP URL: %w", err)
+	}
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create browser auth cookie jar: %w", err)
+	}
+	httpClient := &http.Client{
+		Jar: jar,
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: insecure, //nolint:gosec
+		}},
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sessionsURL.String(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create reentrance ticket request: %w", err)
+	}
+	req.Header.Set("MYSAPSSO2", ticket)
+	req.Header.Set("Accept", sessionInformationAccept)
+	req.Header.Set("User-Agent", "Eclipse/4.39.0 (win32; x86_64) ADT/3.56.0 (devedition)")
+	req.Header.Set("sap-adt-purpose", "preflight_logon")
+	req.Header.Set("x-sap-security-session", "create")
+	if client != "" {
+		req.Header.Set("sap-client", client)
+	}
+	if language != "" {
+		req.Header.Set("sap-language", language)
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to exchange reentrance ticket: %w", err)
+	}
+	defer resp.Body.Close()
+	sessionBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read reentrance ticket response: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("reentrance ticket exchange failed: HTTP %s", resp.Status)
+	}
+	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
+	if strings.Contains(contentType, "text/html") || strings.Contains(strings.ToLower(string(sessionBody[:min(len(sessionBody), 200)])), "<html") {
+		return nil, fmt.Errorf("reentrance ticket was not accepted by the ADT sessions endpoint")
+	}
+
+	systemInfoURL, accept, err := parseSystemInformationLink(sapURL, sessionBody)
+	if err != nil {
+		return nil, err
+	}
+	systemInfoReq, err := http.NewRequestWithContext(ctx, http.MethodGet, systemInfoURL.String(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create system information request: %w", err)
+	}
+	systemInfoReq.Header.Set("Accept", accept)
+	systemInfoReq.Header.Set("User-Agent", "Eclipse/4.39.0 (win32; x86_64) ADT/3.56.0 (devedition)")
+	systemInfoReq.Header.Set("x-sap-security-session", "use")
+	systemInfoResp, err := httpClient.Do(systemInfoReq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to complete browser authentication: %w", err)
+	}
+	defer systemInfoResp.Body.Close()
+	_, _ = io.Copy(io.Discard, systemInfoResp.Body)
+	if systemInfoResp.StatusCode < 200 || systemInfoResp.StatusCode >= 300 {
+		return nil, fmt.Errorf("browser authentication preflight failed: HTTP %s", systemInfoResp.Status)
+	}
+
+	discoveryURL, err := url.Parse(strings.TrimRight(sapURL, "/") + "/sap/bc/adt/core/discovery")
+	if err != nil {
+		return nil, fmt.Errorf("invalid SAP URL: %w", err)
+	}
+
+	cookies := make(map[string]string)
+	for _, cookie := range jar.Cookies(discoveryURL) {
+		cookies[cookie.Name] = cookie.Value
+	}
+	if !hasSAPSessionCookie(cookies) {
+		return nil, fmt.Errorf("reentrance ticket exchange returned no SAP session cookie")
+	}
+	return cookies, nil
+}
+
+func parseSystemInformationLink(sapURL string, body []byte) (*url.URL, string, error) {
+	var document struct {
+		Links []struct {
+			Relation string `xml:"rel,attr"`
+			Href     string `xml:"href,attr"`
+			Type     string `xml:"type,attr"`
+		} `xml:"link"`
+	}
+	if err := xml.Unmarshal(body, &document); err != nil {
+		return nil, "", fmt.Errorf("invalid browser authentication session response: %w", err)
+	}
+	for _, link := range document.Links {
+		if link.Relation != systemInformationRelation || link.Href == "" {
+			continue
+		}
+		base, err := url.Parse(strings.TrimRight(sapURL, "/") + "/")
+		if err != nil {
+			return nil, "", fmt.Errorf("invalid SAP URL: %w", err)
+		}
+		href, err := url.Parse(link.Href)
+		if err != nil {
+			return nil, "", fmt.Errorf("invalid system information URL: %w", err)
+		}
+		accept := link.Type
+		if accept == "" {
+			accept = "application/xml"
+		}
+		return base.ResolveReference(href), accept, nil
+	}
+	return nil, "", fmt.Errorf("browser authentication session response has no system information link")
+}
+
+func hasSAPSessionCookie(cookies map[string]string) bool {
+	for name := range cookies {
+		if strings.HasPrefix(name, btpAuthCookieName) {
+			return true
+		}
+		for _, prefix := range sapAuthCookieNames {
+			if strings.HasPrefix(name, prefix) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // launchBrowserProcess starts a Chromium browser with DevTools enabled and returns
 // the WebSocket debugger URL. The caller is responsible for calling cleanupBrowser.
 //
@@ -283,34 +585,78 @@ func BrowserLoginWithTarget(ctx context.Context, sapURL, targetOverride string, 
 //  3. Poll http://127.0.0.1:PORT/json/version until it responds with the wsURL
 //
 // This approach is immune to pipe/handle inheritance issues.
-func launchBrowserProcess(ctx context.Context, execPath, sapHost string, insecure, verbose bool) (wsURL string, cmd *exec.Cmd, dataDir string, debugPort int, err error) {
-	// Create temporary user data directory
-	dataDir, err = os.MkdirTemp("", "vsp-browser-*")
+func launchBrowserProcess(ctx context.Context, execPath, sapHost string, insecure, verbose bool) (wsURL string, cmd *exec.Cmd, debugPort int, err error) {
+	dataDir, err := browserDataDir(execPath)
 	if err != nil {
-		return "", nil, "", 0, fmt.Errorf("failed to create temp dir: %w", err)
+		return "", nil, 0, fmt.Errorf("failed to create browser profile: %w", err)
 	}
 
 	// Find a free port for DevTools
 	debugPort, err = findFreePort()
 	if err != nil {
-		os.RemoveAll(dataDir)
-		return "", nil, "", 0, fmt.Errorf("failed to find free port: %w", err)
+		return "", nil, 0, fmt.Errorf("failed to find free port: %w", err)
 	}
 
+	args := buildBrowserProcessArgs(debugPort, dataDir, sapHost, insecure)
+	// Start with about:blank to avoid opening the user's configured start page.
+	// We'll navigate to the real URL via CDP after connecting.
+	args = append(args, "about:blank")
+
+	cmd = exec.CommandContext(ctx, execPath, args...)
+	setBrowserProcessAttrs(cmd)
+	// Redirect all handles away from the MCP protocol pipes
+	cmd.Stdin = nil
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+
+	if err := cmd.Start(); err != nil {
+		return "", nil, 0, fmt.Errorf("failed to start browser: %w", err)
+	}
+
+	if verbose {
+		fmt.Fprintf(os.Stderr, "[BROWSER-AUTH] Launched browser (PID %d) on debug port %d\n", cmd.Process.Pid, debugPort)
+	}
+
+	// Poll the DevTools HTTP endpoint until it responds
+	wsURL, err = pollDevToolsEndpoint(ctx, debugPort, verbose)
+	if err != nil {
+		cmd.Process.Kill()
+		cmd.Wait()
+		return "", nil, 0, err
+	}
+
+	return wsURL, cmd, debugPort, nil
+}
+
+func browserDataDir(execPath string) (string, error) {
+	if override := strings.TrimSpace(os.Getenv("VSP_BROWSER_DATA_DIR")); override != "" {
+		if err := os.MkdirAll(override, 0700); err != nil {
+			return "", err
+		}
+		return override, nil
+	}
+
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		return "", err
+	}
+	browserID := strings.ToLower(strings.ReplaceAll(friendlyBrowserName(execPath), " ", "-"))
+	dataDir := filepath.Join(configDir, "vsp", "browser-auth", browserID)
+	if err := os.MkdirAll(dataDir, 0700); err != nil {
+		return "", err
+	}
+	return dataDir, nil
+}
+
+func buildBrowserProcessArgs(debugPort int, dataDir, sapHost string, insecure bool) []string {
 	args := []string{
 		fmt.Sprintf("--remote-debugging-port=%d", debugPort),
 		"--user-data-dir=" + dataDir,
 		"--no-first-run",
 		"--no-default-browser-check",
 		"--disable-default-apps",
-		"--disable-extensions",
-		"--disable-sync",
 		"--disable-breakpad",
-		"--disable-background-networking",
 		"--disable-component-update",
-		"--enable-automation",
-		"--password-store=basic",
-		"--use-mock-keychain",
 		"--window-size=800,700",
 		// User-Agent mimics Eclipse ADT so SAP sends Negotiate (Kerberos) auth
 		"--user-agent=Eclipse/4.39.0 (win32; x86_64) ADT/3.56.0 (devedition)",
@@ -324,36 +670,7 @@ func launchBrowserProcess(ctx context.Context, execPath, sapHost string, insecur
 	if os.Getuid() == 0 {
 		args = append(args, "--no-sandbox")
 	}
-	// Start with about:blank to avoid opening the user's configured start page.
-	// We'll navigate to the real URL via CDP after connecting.
-	args = append(args, "about:blank")
-
-	cmd = exec.CommandContext(ctx, execPath, args...)
-	setBrowserProcessAttrs(cmd)
-	// Redirect all handles away from the MCP protocol pipes
-	cmd.Stdin = nil
-	cmd.Stdout = nil
-	cmd.Stderr = nil
-
-	if err := cmd.Start(); err != nil {
-		os.RemoveAll(dataDir)
-		return "", nil, "", 0, fmt.Errorf("failed to start browser: %w", err)
-	}
-
-	if verbose {
-		fmt.Fprintf(os.Stderr, "[BROWSER-AUTH] Launched browser (PID %d) on debug port %d\n", cmd.Process.Pid, debugPort)
-	}
-
-	// Poll the DevTools HTTP endpoint until it responds
-	wsURL, err = pollDevToolsEndpoint(ctx, debugPort, verbose)
-	if err != nil {
-		cmd.Process.Kill()
-		cmd.Wait()
-		os.RemoveAll(dataDir)
-		return "", nil, "", 0, err
-	}
-
-	return wsURL, cmd, dataDir, debugPort, nil
+	return args
 }
 
 // findFreePort asks the OS for a free TCP port by binding to :0.
@@ -445,16 +762,24 @@ func pollDevToolsEndpoint(ctx context.Context, port int, verbose bool) (string, 
 	}
 }
 
-// cleanupBrowser kills the browser process and removes its temp directory.
-func cleanupBrowser(cmd *exec.Cmd, dataDir string) {
-	if cmd != nil && cmd.Process != nil {
-		cmd.Process.Kill()
-		cmd.Wait()
+// cleanupBrowser kills the browser process. Its profile remains available for
+// future logins so Edge can retain account sync and password-manager data.
+func cleanupBrowser(cmd *exec.Cmd) {
+	if cmd == nil || cmd.Process == nil {
+		return
 	}
-	if dataDir != "" {
-		// Small delay for Windows file locks to be released
-		time.Sleep(50 * time.Millisecond)
-		os.RemoveAll(dataDir)
+
+	done := make(chan struct{})
+	go func() {
+		cmd.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		cmd.Process.Kill()
+		<-done
 	}
 }
 

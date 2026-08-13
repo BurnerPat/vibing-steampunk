@@ -138,6 +138,16 @@ func (s *Server) ConnectAsync() {
 // 3) cookie_string from config
 // 4) browser_auth from config
 func resolveSystemCookies(systemID string, sysCfg *config.SystemConfig, verbose bool, runtimeCookies map[string]map[string]string) (map[string]string, error) {
+	if sysCfg.BrowserAuth && sysCfg.BrowserExec == "" && strings.TrimSpace(sysCfg.BrowserAuthURL) == "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		apiURL, err := adt.ResolveBrowserAuthAPIURL(ctx, sysCfg.URL, sysCfg.Insecure)
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve ADT API URL: %w", err)
+		}
+		sysCfg.URL = apiURL
+	}
+
 	if runtimeCookies != nil {
 		if c := runtimeCookies[systemID]; len(c) > 0 {
 			return c, nil
@@ -178,7 +188,7 @@ func resolveSystemCookies(systemID string, sysCfg *config.SystemConfig, verbose 
 			_, _ = fmt.Fprintf(os.Stderr, "[BROWSER-AUTH] Starting browser login for system %q (%s)\n", systemID, sysCfg.URL)
 		}
 
-		cookies, err := adt.BrowserLoginWithTarget(context.Background(), sysCfg.URL, sysCfg.BrowserAuthURL, sysCfg.Insecure, timeout, sysCfg.BrowserExec, verbose || sysCfg.Verbose)
+		cookies, err := adt.BrowserLoginWithTargetForClient(context.Background(), sysCfg.URL, sysCfg.BrowserAuthURL, sysCfg.Client, sysCfg.Language, sysCfg.Insecure, timeout, sysCfg.BrowserExec, verbose || sysCfg.Verbose)
 		if err != nil {
 			return nil, fmt.Errorf("browser authentication failed: %w", err)
 		}

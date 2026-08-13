@@ -60,8 +60,9 @@ SAP_URL=http://host:50000 SAP_USER=user SAP_PASSWORD=pass ./vsp
 | `SAP_COOKIE_STRING` / `--cookie-string` | Cookie string (key1=val1; key2=val2) |
 | `SAP_BROWSER_AUTH` / `--browser-auth` | Open browser for SSO login (Kerberos, SAML, Keycloak) |
 | `SAP_BROWSER_AUTH_TIMEOUT` / `--browser-auth-timeout` | SSO login timeout (default: 120s) |
-| `SAP_BROWSER_EXEC` / `--browser-exec` | Path to Chromium browser (default: auto-detect) |
+| `SAP_BROWSER_EXEC` / `--browser-exec` | Use automated auth with a Chromium executable instead of the default system-browser callback |
 | `SAP_BROWSER_AUTH_URL` / `--browser-auth-url` | Override browser login URL (absolute URL or path; default: `/sap/bc/adt/`) |
+| `VSP_BROWSER_DATA_DIR` | Override the persistent browser-auth profile directory |
 | `SAP_COOKIE_SAVE` / `--cookie-save` | Save browser cookies to file for reuse |
 | `SAP_KEEPALIVE` / `--keepalive` | Session keep-alive interval (default: 5m, 0=disabled) |
 | `SAP_MODE` / `--mode` | Tool mode: `focused` (81 tools, default) or `expert` (122 tools) |

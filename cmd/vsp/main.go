@@ -118,7 +118,7 @@ func init() {
 	// Browser-based SSO authentication
 	rootCmd.Flags().Bool("browser-auth", false, "Open browser for SSO login (Kerberos, SAML, Keycloak)")
 	rootCmd.Flags().Duration("browser-auth-timeout", 120*time.Second, "Timeout for browser-based SSO login")
-	rootCmd.Flags().String("browser-exec", "", "Path to Chromium-based browser (default: auto-detect Edge, Chrome, Chromium)")
+	rootCmd.Flags().String("browser-exec", "", "Use automated browser auth with this Chromium executable instead of the system browser callback")
 	rootCmd.Flags().String("browser-auth-url", "", "Override browser login URL (absolute URL or path appended to --url); default: /sap/bc/adt/")
 	rootCmd.Flags().String("cookie-save", "", "Save browser auth cookies to file for reuse with --cookie-file")
 
@@ -355,7 +355,7 @@ func processBrowserAuthSingleSystem(cmd *cobra.Command) error {
 	}
 
 	ctx := context.Background()
-	cookies, err := adt.BrowserLoginWithTarget(ctx, sys.URL, browserAuthURL, sys.Insecure, timeout, browserExec, cfg.Verbose)
+	cookies, err := adt.BrowserLoginWithTargetForClient(ctx, sys.URL, browserAuthURL, sys.Client, sys.Language, sys.Insecure, timeout, browserExec, cfg.Verbose)
 	if err != nil {
 		return fmt.Errorf("browser authentication failed: %w", err)
 	}

@@ -2,6 +2,9 @@ package mcp
 
 import (
 	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -119,6 +122,33 @@ func TestNewServer(t *testing.T) {
 	if err := srv.Shutdown(); err != nil {
 		t.Fatalf("srv.Shutdown failed: %v", err)
 	}
+}
+
+func TestResolveSystemCookiesUsesBrowserAuthAPIURL(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		fmt.Fprintf(w, `{"relatedUrls":{"API":"https://api.example.com","UI":%q}}`, serverURL(req))
+	}))
+	defer server.Close()
+
+	sysCfg := config.SystemConfig{
+		ConnectionConfig:  config.ConnectionConfig{URL: server.URL, Insecure: true},
+		BrowserAuthConfig: config.BrowserAuthConfig{BrowserAuth: true},
+	}
+	cookies := map[string]map[string]string{"AED": {"SAP_SESSIONID_TEST": "session"}}
+	got, err := resolveSystemCookies("AED", &sysCfg, false, cookies)
+	if err != nil {
+		t.Fatalf("resolveSystemCookies() failed: %v", err)
+	}
+	if got["SAP_SESSIONID_TEST"] != "session" {
+		t.Fatalf("cookies = %#v", got)
+	}
+	if sysCfg.URL != "https://api.example.com" {
+		t.Fatalf("system URL = %q, want API URL", sysCfg.URL)
+	}
+}
+
+func serverURL(req *http.Request) string {
+	return "https://" + req.Host
 }
 
 func TestDebuggerGetVariablesSchemaIncludesItems(t *testing.T) {
