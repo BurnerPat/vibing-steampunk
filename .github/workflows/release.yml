@@ -95,7 +95,15 @@ jobs:
           echo "Releasing ${VERSION}"
 
       # ------------------------------------------------------------------ #
-      # 5. Install git-cliff (pinned to a known-good release)
+      # 5. Synchronize main before generating the release changelog
+      # ------------------------------------------------------------------ #
+      - name: Synchronize main
+        run: |
+          git fetch origin main
+          git checkout -B main origin/main
+
+      # ------------------------------------------------------------------ #
+      # 6. Install git-cliff (pinned to a known-good release)
       # ------------------------------------------------------------------ #
       - name: Install git-cliff
         uses: taiki-e/install-action@v2
@@ -103,7 +111,7 @@ jobs:
           tool: git-cliff@2.12.0
 
       # ------------------------------------------------------------------ #
-      # 6. Generate CHANGELOG.md and commit it
+      # 7. Generate CHANGELOG.md and commit it
       #    --tag assigns all commits since the previous tag to the new version,
       #    so the output contains only released versions (no [Unreleased] block)
       # ------------------------------------------------------------------ #
@@ -124,21 +132,18 @@ jobs:
           fi
 
       # ------------------------------------------------------------------ #
-      # 7. Tag and push
-      #    Rebase onto the latest main first in case it moved since checkout
-      #    (e.g. a previous run's CHANGELOG commit), then push the commit
-      #    before the tag so goreleaser finds it.
+      # 8. Tag and push
+      #    main was synchronized before the generated CHANGELOG commit, so
+      #    do not rebase it here: a concurrent CHANGELOG change would conflict.
       # ------------------------------------------------------------------ #
       - name: Tag and push
         run: |
-          git fetch origin main
-          git rebase origin/main
           git tag "${{ steps.version.outputs.version }}"
           git push origin HEAD:main
           git push origin "${{ steps.version.outputs.version }}"
 
       # ------------------------------------------------------------------ #
-      # 8. GoReleaser — builds all 9 platform binaries, creates GitHub release
+      # 9. GoReleaser — builds all 9 platform binaries, creates GitHub release
       #    Reads .goreleaser.yml + cliff.toml from the repo root
       # ------------------------------------------------------------------ #
       - name: Run GoReleaser
