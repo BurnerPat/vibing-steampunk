@@ -112,12 +112,12 @@ jobs:
 
       # ------------------------------------------------------------------ #
       # 7. Generate CHANGELOG.md and commit it
-      #    --tag assigns all commits since the previous tag to the new version,
-      #    so the output contains only released versions (no [Unreleased] block)
+      #    --latest limits the output to the new release section: commits since
+      #    the previous tag. --tag supplies that section's release version.
       # ------------------------------------------------------------------ #
       - name: Generate CHANGELOG.md
         run: |
-          git-cliff --tag "${{ steps.version.outputs.version }}" --output CHANGELOG.md
+          git-cliff --latest --tag "${{ steps.version.outputs.version }}" --output CHANGELOG.md
 
       - name: Commit CHANGELOG.md
         run: |
