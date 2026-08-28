@@ -95,12 +95,18 @@ jobs:
           echo "Releasing ${VERSION}"
 
       # ------------------------------------------------------------------ #
-      # 5. Synchronize main before generating the release changelog
+      # 5. Merge develop into main before generating the release changelog
+      #    Releases are cut from main, but new work lands on develop first.
+      #    Bringing it in here (instead of just resetting to origin/main)
+      #    ensures the release actually contains develop's commits.
       # ------------------------------------------------------------------ #
-      - name: Synchronize main
+      - name: Merge develop into main
         run: |
-          git fetch origin main
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin main develop
           git checkout -B main origin/main
+          git merge --no-ff origin/develop -m "chore(release): merge develop into main"
 
       # ------------------------------------------------------------------ #
       # 6. Install git-cliff (pinned to a known-good release)
