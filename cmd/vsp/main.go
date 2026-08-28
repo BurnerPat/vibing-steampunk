@@ -118,7 +118,7 @@ func init() {
 	// Browser-based SSO authentication
 	rootCmd.Flags().Bool("browser-auth", false, "Open browser for SSO login (Kerberos, SAML, Keycloak)")
 	rootCmd.Flags().Duration("browser-auth-timeout", 120*time.Second, "Timeout for browser-based SSO login")
-	rootCmd.Flags().String("browser-exec", "", "Path to Chromium-based browser (default: auto-detect Edge, Chrome, Chromium)")
+	rootCmd.Flags().String("browser-exec", "", "Use automated browser auth with this Chromium executable instead of the system browser callback")
 	rootCmd.Flags().String("browser-auth-url", "", "Override browser login URL (absolute URL or path appended to --url); default: /sap/bc/adt/")
 	rootCmd.Flags().String("cookie-save", "", "Save browser auth cookies to file for reuse with --cookie-file")
 
@@ -173,7 +173,7 @@ func init() {
 	// SNC/SSO configuration (via SAP UI Landscape)
 	rootCmd.Flags().BoolVar(&singleSys.SNC, "snc", false, "Enable SNC single sign-on via JCo (requires --sysid)")
 	rootCmd.Flags().StringVar(&singleSys.SysID, "sysid", "", "SAP System ID for SNC logon (3-char SID, reads connection from SAP UI Landscape)")
-	rootCmd.Flags().StringVar(&singleSys.LandscapeFile, "landscape-file", "", "Path to SAP UI Landscape XML (auto-discovered if not set)")
+	rootCmd.Flags().StringVar(&cfg.LandscapeFile, "landscape-file", "", "Path to SAP UI Landscape XML (auto-discovered if not set)")
 
 	// Output options
 	rootCmd.Flags().BoolVarP(&cfg.Verbose, "verbose", "v", false, "Enable verbose output to stderr")
@@ -290,15 +290,14 @@ func runServer(cmd *cobra.Command, _ []string) error {
 		}
 	}()
 
-	// Connect phase: validate credentials and establish transports
-	if err := srv.Connect(context.Background()); err != nil {
-		return fmt.Errorf("failed to connect to systems: %w", err)
-	}
-
-	// Start phase: activate runtime behavior (e.g., keep-alive)
-	if err := srv.Start(context.Background()); err != nil {
-		return fmt.Errorf("failed to start systems: %w", err)
-	}
+	// Begin serving immediately. Connecting to SAP and starting the JCo sidecar
+	// can take several seconds; doing that synchronously here would delay the MCP
+	// protocol handshake and cause the client's first tool call to fail with an
+	// undefined-reference error. Instead, register tools now and warm up each
+	// system's connection in the background. Tool handlers block on the target
+	// system's readiness (see System.EnsureReady) so the first call is slow but
+	// succeeds.
+	srv.ConnectAsync()
 
 	return srv.ServeStdio()
 }
@@ -356,7 +355,7 @@ func processBrowserAuthSingleSystem(cmd *cobra.Command) error {
 	}
 
 	ctx := context.Background()
-	cookies, err := adt.BrowserLoginWithTarget(ctx, sys.URL, browserAuthURL, sys.Insecure, timeout, browserExec, cfg.Verbose)
+	cookies, err := adt.BrowserLoginWithTargetForClient(ctx, sys.URL, browserAuthURL, sys.Client, sys.Language, sys.Insecure, timeout, browserExec, cfg.Verbose)
 	if err != nil {
 		return fmt.Errorf("browser authentication failed: %w", err)
 	}

@@ -95,7 +95,21 @@ jobs:
           echo "Releasing ${VERSION}"
 
       # ------------------------------------------------------------------ #
-      # 5. Install git-cliff (pinned to a known-good release)
+      # 5. Merge develop into main before generating the release changelog
+      #    Releases are cut from main, but new work lands on develop first.
+      #    Bringing it in here (instead of just resetting to origin/main)
+      #    ensures the release actually contains develop's commits.
+      # ------------------------------------------------------------------ #
+      - name: Merge develop into main
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin main develop
+          git checkout -B main origin/main
+          git merge --no-ff origin/develop -m "chore(release): merge develop into main"
+
+      # ------------------------------------------------------------------ #
+      # 6. Install git-cliff (pinned to a known-good release)
       # ------------------------------------------------------------------ #
       - name: Install git-cliff
         uses: taiki-e/install-action@v2
@@ -103,13 +117,13 @@ jobs:
           tool: git-cliff@2.12.0
 
       # ------------------------------------------------------------------ #
-      # 6. Generate CHANGELOG.md and commit it
-      #    --tag assigns all commits since the previous tag to the new version,
-      #    so the output contains only released versions (no [Unreleased] block)
+      # 7. Generate CHANGELOG.md and commit it
+      #    --latest limits the output to the new release section: commits since
+      #    the previous tag. --tag supplies that section's release version.
       # ------------------------------------------------------------------ #
       - name: Generate CHANGELOG.md
         run: |
-          git-cliff --tag "${{ steps.version.outputs.version }}" --output CHANGELOG.md
+          git-cliff --latest --tag "${{ steps.version.outputs.version }}" --output CHANGELOG.md
 
       - name: Commit CHANGELOG.md
         run: |
@@ -124,21 +138,18 @@ jobs:
           fi
 
       # ------------------------------------------------------------------ #
-      # 7. Tag and push
-      #    Rebase onto the latest main first in case it moved since checkout
-      #    (e.g. a previous run's CHANGELOG commit), then push the commit
-      #    before the tag so goreleaser finds it.
+      # 8. Tag and push
+      #    main was synchronized before the generated CHANGELOG commit, so
+      #    do not rebase it here: a concurrent CHANGELOG change would conflict.
       # ------------------------------------------------------------------ #
       - name: Tag and push
         run: |
-          git fetch origin main
-          git rebase origin/main
           git tag "${{ steps.version.outputs.version }}"
           git push origin HEAD:main
           git push origin "${{ steps.version.outputs.version }}"
 
       # ------------------------------------------------------------------ #
-      # 8. GoReleaser — builds all 9 platform binaries, creates GitHub release
+      # 9. GoReleaser — builds all 9 platform binaries, creates GitHub release
       #    Reads .goreleaser.yml + cliff.toml from the repo root
       # ------------------------------------------------------------------ #
       - name: Run GoReleaser

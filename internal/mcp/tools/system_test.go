@@ -25,6 +25,10 @@ func (m *mockSystem) Connect(_ context.Context) error { return nil }
 
 func (m *mockSystem) Start(_ context.Context) error { return nil }
 
+func (m *mockSystem) InitAsync() {}
+
+func (m *mockSystem) EnsureReady(_ context.Context) error { return nil }
+
 func (m *mockSystem) Shutdown() error { return nil }
 
 func TestHandleGetFeatures(t *testing.T) {

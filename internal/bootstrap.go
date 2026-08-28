@@ -186,13 +186,20 @@ func augmentSystemConfiguration(sys *config.SystemConfig, globalCfg *config.Glob
 		if sys.SysID == "" {
 			return fmt.Errorf("--sysid is required when --snc is specified")
 		}
+		// Per-system landscape file takes precedence; otherwise fall back to the
+		// global --landscape-file flag (which is ignored in multi-system mode
+		// unless applied here, since singleSys is discarded).
+		landscapeFile := sys.LandscapeFile
+		if landscapeFile == "" {
+			landscapeFile = globalCfg.LandscapeFile
+		}
 		if globalCfg.Verbose {
 			_, _ = fmt.Fprintf(os.Stderr, "[VERBOSE] SNC mode: resolving system %q from SAP UI Landscape\n", sys.SysID)
-			if sys.LandscapeFile != "" {
-				_, _ = fmt.Fprintf(os.Stderr, "[VERBOSE] Using landscape file: %s\n", sys.LandscapeFile)
+			if landscapeFile != "" {
+				_, _ = fmt.Fprintf(os.Stderr, "[VERBOSE] Using landscape file: %s\n", landscapeFile)
 			}
 		}
-		jcoProps, err := adt.ResolveSNCJcoProperties(sys.SysID, sys.LandscapeFile, sys.Client, sys.Language)
+		jcoProps, err := adt.ResolveSNCJcoProperties(sys.SysID, landscapeFile, sys.Client, sys.Language)
 		if err != nil {
 			return fmt.Errorf("SNC configuration failed: %w", err)
 		}

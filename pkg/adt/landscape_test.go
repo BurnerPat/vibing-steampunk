@@ -3,6 +3,7 @@ package adt
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -398,6 +399,21 @@ func TestGlobalFilePath(t *testing.T) {
 	if result != "" {
 		t.Errorf("expected empty for SAPGUILandscape.xml, got %s", result)
 	}
+}
+
+func TestSNCLibraryScanDirsIncludesSecureLoginClientOnDarwin(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("macOS-specific SNC library path")
+	}
+
+	const secureLoginClientDir = "/Applications/Secure Login Client.app/Contents/MacOS/lib"
+	for _, dir := range sncLibraryScanDirs() {
+		if dir == secureLoginClientDir {
+			return
+		}
+	}
+
+	t.Errorf("SNC library scan directories do not contain %q", secureLoginClientDir)
 }
 
 func assertProp(t *testing.T, props map[string]string, key, expected string) {

@@ -38,6 +38,17 @@ type System interface {
 	// Returns error if runtime activation fails.
 	Start(ctx context.Context) error
 
+	// InitAsync starts background initialization for the system: JCo sidecar
+	// startup (RFC mode), endpoint discovery (Connect) and runtime activation
+	// (Start). It is non-blocking and idempotent; the first call kicks off the
+	// work, later calls are no-ops. Handlers must call EnsureReady before use.
+	InitAsync()
+
+	// EnsureReady blocks until background initialization started by InitAsync has
+	// completed, or until ctx is cancelled. It returns the initialization error,
+	// if any. Safe to call concurrently and repeatedly.
+	EnsureReady(ctx context.Context) error
+
 	// Shutdown gracefully stops system resources (keep-alive, sidecar).
 	// Shutdown is idempotent and safe to call multiple times.
 	Shutdown() error

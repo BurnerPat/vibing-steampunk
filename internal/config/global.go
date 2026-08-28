@@ -96,6 +96,7 @@ type GlobalConfig struct {
 	RfcMaxConcurrent int
 	JcoProxyJar      string
 	JavaPath         string
+	LandscapeFile    string // Explicit SAP UI Landscape XML path (fallback for systems without their own)
 
 	// Global safety settings
 	ReadOnly                bool

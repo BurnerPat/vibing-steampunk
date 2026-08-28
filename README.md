@@ -86,7 +86,7 @@ make build
 
 - **Username/password (HTTP ADT)** for standard Basic auth.
 - **Cookie auth (HTTP ADT)** using either `--cookie-file` (Netscape format) or `--cookie-string`.
-- **Browser-based SSO (HTTP ADT)** via `--browser-auth` for Kerberos/SAML/Keycloak flows; by default it opens `URL + /sap/bc/adt/`, and you can override the target with `--browser-auth-url` or `SAP_BROWSER_AUTH_URL`.
+- **Browser-based SSO (HTTP ADT)** via `--browser-auth` for Kerberos/SAML/Keycloak flows. By default VSP uses the system browser and an ADT reentrance-ticket callback, so the browser's normal profile, active sessions, and password manager remain available.
 - **SNC/SSO (RFC mode)** using `--connection-mode rfc --snc --sysid <SID>` with SAP UI Landscape/JCo settings.
 
 Examples:
@@ -98,12 +98,32 @@ Examples:
 # 2) Cookie file (HTTP ADT)
 ./build/vsp --url https://sap-host:44300 --cookie-file ./cookies.txt
 
-# 3) Browser SSO with custom login target (HTTP ADT)
-./build/vsp --url https://sap-host:44300 --browser-auth --browser-auth-url /sap/bc/ui2/flp
+# 3) Browser SSO in the normal system browser (HTTP ADT)
+./build/vsp --url https://sap-host:44300 --browser-auth
 
 # 4) SNC/SSO (RFC mode)
 ./build/vsp --connection-mode rfc --snc --sysid QAS --client 200
 ```
+
+#### Browser SSO callback flow
+
+With `--browser-auth`, VSP starts a temporary HTTP listener on the loopback interface and opens the SAP ADT reentrance-ticket endpoint in the system browser. After SSO completes, SAP redirects to the local listener. VSP exchanges the short-lived ticket for a stateful ADT session and then shuts down the listener.
+
+For a named system in `.vsp.json`:
+
+```json
+{
+  "systems": {
+    "cloud-dev": {
+      "url": "https://example.abap-web.eu10.hana.ondemand.com",
+      "browser_auth": true,
+      "browser_auth_timeout": "120s"
+    }
+  }
+}
+```
+
+Set `--browser-exec` or `browser_exec` to use the automated Chromium fallback instead. A custom `--browser-auth-url` also requires that fallback because arbitrary login targets cannot redirect the reentrance ticket to VSP. The automated browser uses a dedicated persistent profile; `VSP_BROWSER_DATA_DIR` overrides its location.
 
 ### Useful CLI utilities
 
